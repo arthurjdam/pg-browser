@@ -1,0 +1,26 @@
+[package]
+name = "pgbrowser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pg-browser"
+path = "src/main.rs"
+
+[features]
+# Dev tool: `PGB_SCREENSHOT=out.png cargo run -p pgbrowser --features screenshot` renders one frame
+# offscreen to a PNG and quits, so UI can be checked without a display capture permission.
+screenshot = ["gpui-kit/test-support", "dep:image"]
+
+[dependencies]
+anyhow.workspace = true
+gpui-kit.workspace = true
+# Pin the GPUI snapshot: gpui-component 0.6.4 does not compile against gpui-pre 0.3.6 (inspector API).
+gpui-pre = "=0.3.5"
+pgcore = { path = "../pgcore" }
+zedtheme = { path = "../zedtheme" }
+serde_json = "1"
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+tokio.workspace = true

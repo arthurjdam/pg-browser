@@ -1,0 +1,11 @@
+[package]
+name = "zedtheme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Converts Zed theme files (v0.2.0 schema) into gpui-component themes. No GPUI dependency."
+
+[dependencies]
+serde_json = "1"
+thiserror = "2"

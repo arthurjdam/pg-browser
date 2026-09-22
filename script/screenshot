@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Renders one frame of the app to a PNG using GPUI's offscreen capture (no screen-recording
+# permission needed) and prints how many distinct colours the main area has. A flat 206-colour
+# "Connecting..." frame means the window was never presented, typically because the display is
+# asleep; this script wakes it (caffeinate) for the duration of the run.
+#
+#   script/screenshot out.png [VAR=value ...]       e.g. PGB_OPEN=shop.customers PGB_SORT=id:desc
+#
+# Needs the docker test server (docker/compose.yml). Dev hooks: PGB_OPEN, PGB_FILTER, PGB_MATCH,
+# PGB_SORT, PGB_PAGE_SIZE, PGB_OFFSET, PGB_STAGE, PGB_REVIEW, PGB_THEME.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+out="$1"; shift
+cargo build -q -p pgbrowser --features screenshot
+caffeinate -u -d -t 40 &
+keepawake=$!
+trap 'kill $keepawake 2>/dev/null || true; pkill -f target/debug/pg-browser 2>/dev/null || true' EXIT
+env PGB_SCREENSHOT="$out" PGB_SCREENSHOT_DELAY_MS="${DELAY:-3500}" \
+    PGB_URL="${PGB_URL:-postgresql://pgb_admin:admin@localhost:55416/pgb}" PGB_AUTOCONNECT=1 PGB_EXPAND="${PGB_EXPAND:-shop}" \
+    "$@" ./target/debug/pg-browser >"$out.log" 2>&1 &
+for _ in $(seq 1 40); do sleep 1; pgrep -f target/debug/pg-browser >/dev/null || break; done
+python3 - "$out" <<'PY'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]).convert("RGB")
+w, h = im.size
+colours = len(im.crop((w * 47 // 100, h * 19 // 100, w * 94 // 100, h * 75 // 100)).getcolors(maxcolors=10**7))
+print(f"{sys.argv[1]}: {colours} colours" + ("  <-- flat: window not presented (display asleep?)" if colours < 250 else ""))
+PY

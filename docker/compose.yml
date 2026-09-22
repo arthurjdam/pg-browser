@@ -1,0 +1,41 @@
+# Test servers for pg-browser.
+#   pg16      plain, scram auth          -> postgresql://pgb_admin:admin@localhost:55416/pgb
+#   pg17-ssl  TLS required, self-signed  -> postgresql://pgb_admin:admin@localhost:55417/pgb?sslmode=verify-full
+# Run ./docker/gen-certs.sh once before starting pg17-ssl.
+services:
+  pg16:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: pgb_admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: pgb
+    ports: ["55416:5432"]
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgb_admin -d pgb"]
+      interval: 2s
+      retries: 30
+
+  pg17-ssl:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: pgb_admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: pgb
+    ports: ["55417:5432"]
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./certs/server.crt:/var/lib/postgresql/server.crt:ro
+      - ./certs/server.key:/var/lib/postgresql/server.key:ro
+      - ./certs/ca.crt:/var/lib/postgresql/ca.crt:ro
+    command: >
+      postgres
+      -c ssl=on
+      -c ssl_cert_file=/var/lib/postgresql/server.crt
+      -c ssl_key_file=/var/lib/postgresql/server.key
+      -c ssl_ca_file=/var/lib/postgresql/ca.crt
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgb_admin -d pgb"]
+      interval: 2s
+      retries: 30
