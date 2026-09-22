@@ -16,7 +16,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, StyledExt as _, WindowExt as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use pgcore::catalog::{self, ForeignKey};
@@ -280,7 +280,18 @@ pub struct DataView {
 
     grid: Entity<TableState<Grid>>,
     filter_input: Entity<InputState>,
+    /// Gives the grid keyboard focus so arrow keys, Enter, Escape and Delete work on the
+    /// selected cell; see `on_grid_key_down`.
+    container_focus: FocusHandle,
     edit_input: Entity<InputState>,
+    /// Dev hook (`PGB_VIEW=column`): opens the value viewer for that column of row 0, once the
+    /// first page has loaded. Guards against firing more than once.
+    dev_view_opened: bool,
+    /// Guards `dev_grid_keys_from_env` against firing more than once.
+    dev_grid_keys_applied: bool,
+    /// The value viewer dialog most recently opened by [`Self::open_value_viewer`], kept only so
+    /// `PGB_VIEW`'s dev hook can drive its navigation for screenshots; the real UI never reads this.
+    dev_active_viewer: Option<Entity<crate::value_viewer::ValueViewer>>,
 }
 
 struct Grid {
@@ -339,6 +350,7 @@ impl DataView {
         .detach();
 
         let edit_input = cx.new(|cx| InputState::new(window, cx));
+        let container_focus = cx.focus_handle();
         cx.subscribe_in(&edit_input, window, |this, _, event: &InputEvent, _, cx| {
             // Enter or clicking away keeps the edit; Escape (handled by the cell) drops it first.
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -375,6 +387,10 @@ impl DataView {
             grid,
             filter_input,
             edit_input,
+            container_focus,
+            dev_view_opened: false,
+            dev_grid_keys_applied: false,
+            dev_active_viewer: None,
         };
         this.load(initial.query, initial.offset, initial.page_size, true, cx);
         this
@@ -568,6 +584,20 @@ impl DataView {
         cx.notify();
     }
 
+    /// Dev hook: `PGB_GRID_KEY=down,down,right,enter` (comma-separated) drives `handle_grid_key`
+    /// directly, for screenshotting keyboard navigation without simulating real OS key events. Runs
+    /// from `render` (not `apply`, which has no `window`), guarded to fire once.
+    fn dev_grid_keys_from_env(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dev_grid_keys_applied || !matches!(self.load, Load::Ready) {
+            return;
+        }
+        let Ok(keys) = std::env::var("PGB_GRID_KEY") else { return };
+        self.dev_grid_keys_applied = true;
+        for key in keys.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            self.handle_grid_key(key, window, cx);
+        }
+    }
+
     /// Runs the exact count on its own short-lived connection with a time limit.
     fn start_count(&mut self, cx: &mut Context<Self>) {
         self.count_generation += 1;
@@ -729,10 +759,134 @@ impl DataView {
         }
         // Clicking another cell while editing commits first (the input's blur does it).
         self.selected = Some((row, col));
+        window.focus(&self.container_focus, cx);
         self.sync_grid(cx);
         if clicks >= 2 {
-            self.begin_edit(row, col, window, cx);
+            let existing = self.existing_rows(cx);
+            if row < existing && self.original_cell(row, col, cx).is_large() {
+                self.open_value_viewer(row, col, window, cx);
+            } else {
+                self.begin_edit(row, col, window, cx);
+            }
         }
+    }
+
+    /// Opens the large value at (row, col) in its own dialog: a lazy jsonb tree, or a capped
+    /// read/replace view for any other large-capable type. Reading is always allowed; writing is
+    /// gated on UPDATE privilege, same as everywhere else in the grid.
+    fn open_value_viewer(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(grid_row) = self.grid.read(cx).delegate().rows.get(row).cloned() else { return };
+        let key = match row_key(&self.columns, &grid_row) {
+            Ok(key) => key,
+            Err(err) => {
+                self.banner = Some((err, false));
+                cx.notify();
+                return;
+            }
+        };
+        let column_label = self.columns[col].name.clone();
+        let target = crate::value_viewer::Target {
+            params: self.params.clone(),
+            schema: self.schema.clone(),
+            table: self.table.clone(),
+            columns: self.columns.clone(),
+            key,
+            column: column_label.clone(),
+        };
+        let editable = self.editability.update && self.editability.read_only_reason.is_none();
+        let viewer = cx.new(|cx| crate::value_viewer::ValueViewer::open(target, editable, window, cx));
+        self.dev_active_viewer = Some(viewer.clone());
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.w(px(760.)).h(px(560.)).title(column_label.clone()).child(viewer.clone())
+        });
+    }
+
+    /// Dev-only: runs `f` against the currently open value viewer, if any (see `dev_active_viewer`).
+    fn drive_dev_view(
+        &mut self,
+        window: &mut Window,
+        f: impl FnOnce(&mut crate::value_viewer::ValueViewer, &mut Window, &mut Context<crate::value_viewer::ValueViewer>),
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(viewer) = self.dev_active_viewer.clone() {
+            viewer.update(cx, |vv, cx| f(vv, window, cx));
+        }
+    }
+
+    /// Arrow keys move the selected cell; Enter opens it for editing (or the value viewer, for a
+    /// large cell); Escape cancels an open edit or clears the selection; Delete/Backspace sets the
+    /// selected cell to NULL, mirroring the "Set NULL" toolbar button (spreadsheet convention).
+    /// Movement is deliberately raw key matching rather than the framework's `SelectUp`/`SelectDown`
+    /// actions: `TableState` already consumes those internally for its own selection concept, which
+    /// would fight the one this view keeps for staged edits.
+    fn on_grid_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_grid_key(&ev.keystroke.key, window, cx);
+    }
+
+    /// Pure-ish key handling, split out from `on_grid_key_down` so a dev hook (`PGB_GRID_KEY`) can
+    /// drive it directly with a plain string instead of constructing a synthetic `KeyDownEvent`.
+    fn handle_grid_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.applying || self.review.is_some() {
+            return;
+        }
+        if key == "escape" {
+            if self.editing.is_some() {
+                self.cancel_edit(cx);
+            } else if self.selected.is_some() {
+                self.selected = None;
+                self.sync_grid(cx);
+            }
+            return;
+        }
+        if self.editing.is_some() {
+            return; // Let the editor's own input handle everything else while open.
+        }
+        let existing = self.existing_rows(cx);
+        let total_rows = existing + self.pending.inserts.len();
+        let cols = self.columns.len();
+        if total_rows == 0 || cols == 0 {
+            return;
+        }
+        let (row, col) = self.selected.unwrap_or((0, 0));
+        match key {
+            "up" => self.move_selection(row.saturating_sub(1), col, cx),
+            "down" => self.move_selection((row + 1).min(total_rows - 1), col, cx),
+            "left" => self.move_selection(row, col.saturating_sub(1), cx),
+            "right" => self.move_selection(row, (col + 1).min(cols - 1), cx),
+            "enter" => {
+                if self.selected.is_none() {
+                    self.move_selection(0, 0, cx);
+                } else if row < existing && self.original_cell(row, col, cx).is_large() {
+                    self.open_value_viewer(row, col, window, cx);
+                } else {
+                    self.begin_edit(row, col, window, cx);
+                }
+            }
+            "backspace" | "delete" => {
+                if self.selected.is_some() && self.edit_block_reason(row, col, cx).is_none() {
+                    self.set_selected(NewValue::Null, cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn move_selection(&mut self, row: usize, col: usize, cx: &mut Context<Self>) {
+        self.selected = Some((row, col));
+        self.grid.update(cx, |state, cx| state.scroll_to_row(row, cx));
+        self.sync_grid(cx);
+    }
+
+    /// Reruns the current page/sort/filter, as if Reload had been clicked. A no-op while locked
+    /// (pending edits, applying, reviewing) or before the first load — used by the app-level
+    /// `ReloadActive` shortcut, which does not know the view's internal state.
+    pub fn reload_now(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+    }
+
+    /// Focuses this view's filter bar — used by the app-level `FocusFilter` shortcut.
+    pub fn focus_filter_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.filter_input.update(cx, |input, cx| input.focus(window, cx));
     }
 
     /// Whether the cell may be edited, with the reason if not.
@@ -759,10 +913,7 @@ impl DataView {
             && !self.pending.cells.contains_key(&(row, col))
             && self.original_cell(row, col, cx).is_large()
         {
-            return Some(
-                "This is a large value that isn't loaded. Editing large values needs the value editor, which isn't built yet."
-                    .into(),
-            );
+            return Some("This is a large value. Double-click it to open the value viewer.".into());
         }
         None
     }
@@ -1134,7 +1285,59 @@ impl DataView {
 }
 
 impl Render for DataView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Runs as a deferred update (not synchronously inside render): opening a dialog mutates
+        // the window's Root, whose own render pass may already be under way for this same frame.
+        // `PGB_VIEW=column[.segment...]` opens that column's value viewer for row 0 and navigates
+        // into a path (a numeric segment is an array index, anything else an object key); with
+        // `PGB_VIEW_EDIT=1` it also opens the editor once there.
+        self.dev_grid_keys_from_env(window, cx);
+        if !self.dev_view_opened && matches!(self.load, Load::Ready) && self.row_count > 0 {
+            if let Ok(spec) = std::env::var("PGB_VIEW") {
+                self.dev_view_opened = true;
+                let mut parts = spec.split('.');
+                if let Some(col) = parts.next().and_then(|name| self.columns.iter().position(|c| c.name == name)) {
+                    let path: Vec<crate::value_viewer::DevPathStep> = parts
+                        .map(|seg| match seg.parse::<i64>() {
+                            Ok(n) => crate::value_viewer::DevPathStep::Index(n),
+                            Err(_) => crate::value_viewer::DevPathStep::Key(seg.to_string()),
+                        })
+                        .collect();
+                    let then_edit = std::env::var_os("PGB_VIEW_EDIT").is_some();
+                    cx.spawn_in(window, async move |this, cx| {
+                        this.update_in(cx, |this, window, cx| {
+                            this.open_value_viewer(0, col, window, cx);
+                        })
+                        .ok();
+                        if !path.is_empty() || then_edit {
+                            // Give the dialog's first load (and, per step, each navigation) time to
+                            // land before driving the next one; this is a screenshot aid only.
+                            for step in &path {
+                                cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+                                this.update_in(cx, |this, window, cx| {
+                                    this.drive_dev_view(window, |v, window, cx| v.dev_open_child(step, window, cx), cx)
+                                })
+                                .ok();
+                            }
+                            if then_edit {
+                                cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+                                this.update_in(cx, |this, window, cx| {
+                                    this.drive_dev_view(window, |v, window, cx| v.dev_begin_edit(window, cx), cx)
+                                })
+                                .ok();
+                                // Note: PGB_VIEW_SAVE (driving Save via this same dev-hook chain) was tried and
+                                // removed — its spawned write task never got polled, apparently an artifact of
+                                // simulating a click through several nested `update_in` calls from inside an
+                                // already-running spawned task, since the identical `cx.spawn_in` shape works
+                                // correctly for `reload()` at the same nesting depth. Save itself is unverified
+                                // by screenshot; `jsontree::set_at_path` is covered by pgcore's integration tests.
+                            }
+                        }
+                    })
+                    .detach();
+                }
+            }
+        }
         let theme = cx.theme();
         let loading = matches!(self.load, Load::Loading);
         let idle = matches!(self.load, Load::Ready);
@@ -1320,7 +1523,11 @@ impl Render for DataView {
         };
 
         v_flex()
+            .id("data-view")
+            .track_focus(&self.container_focus)
+            .key_context("DataGrid")
             .size_full()
+            .on_key_down(cx.listener(Self::on_grid_key_down))
             .child(toolbar)
             .when(!failed, |v| v.child(self.render_edit_bar(cx)))
             .when(!failed && self.review.is_none(), |v| v.child(filter_bar))
@@ -1433,6 +1640,7 @@ impl TableDelegate for Grid {
             .id(("cell", row_ix * 4096 + col_ix))
             .w_full()
             .truncate()
+            .cursor_pointer()
             .border_1()
             .border_color(if is_selected { theme.primary } else { gpui_kit::transparent_black() })
             .when(numeric, |d| d.text_right())

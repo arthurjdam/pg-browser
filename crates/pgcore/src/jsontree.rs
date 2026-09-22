@@ -82,7 +82,16 @@ impl NodeKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeInfo {
     pub kind: NodeKind,
-    /// `pg_column_size` of the sub-value: on-disk (often compressed) bytes, not its text length.
+    /// `pg_column_size` of the sub-value at this path.
+    ///
+    /// **Only the root (an empty path, i.e. the column itself) reports a genuinely compressed
+    /// on-disk size** — verified empirically: a ~30 MB root document that is 864 KB TOAST-compressed
+    /// on disk reports a *child* extracted from it via `jsonb_each`/`jsonb_array_elements` as ~32 MB
+    /// (close to its raw JSONB binary size, not its text size, and not compressed). This is
+    /// `pg_column_size`'s documented behaviour: it reports the stored size for an actual toasted
+    /// attribute, and falls back to the plain in-memory size for a freshly-computed expression
+    /// result, which is exactly what every non-root node here is. Still a safe, useful guard and
+    /// size estimate — just not literally "bytes on disk" below the root.
     pub stored_bytes: i64,
     /// Key or element count, for `Object` / `Array`.
     pub count: Option<i64>,

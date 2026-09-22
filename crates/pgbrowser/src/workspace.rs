@@ -1,5 +1,6 @@
 //! The main window: title bar, connection sidebar (schema/table tree), content and status bar.
 
+use crate::app_actions::{CloseActiveTab, FocusFilter, FocusNavigator, NextTab, PrevTab, ReloadActive};
 use crate::data_view::{DataView, DataViewEvent, Initial};
 use crate::runtime;
 use gpui_kit::assets::IconName;
@@ -7,7 +8,7 @@ use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, StyledExt as _, TitleBar};
+use gpui_kit::component::{ActiveTheme as _, Icon, Root, Sizable as _, StyledExt as _, TitleBar};
 use gpui_kit::*;
 use pgcore::catalog::{self, Relation, RelationKind, Schema};
 use pgcore::config::{ConnectionParams, parse_conninfo};
@@ -47,6 +48,22 @@ pub struct Workspace {
     /// Open tables, one connection each.
     tabs: Vec<Tab>,
     active_tab: usize,
+    /// Gives the navigator keyboard focus; see `on_nav_key_down`.
+    nav_focus: FocusHandle,
+    /// Index into `nav_rows()` of the keyboard-highlighted row, independent of which row was last
+    /// clicked (clicking a schema/relation acts immediately; the keyboard highlight is separate so
+    /// arrow keys can move without re-triggering an action each step).
+    nav_highlight: Option<usize>,
+    /// Guards the `PGB_ACTION` dev hook against firing more than once.
+    dev_action_applied: bool,
+}
+
+/// One visible row of the navigator, flattened for keyboard movement; mirrors what `render_tree`
+/// draws, in the same order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavRow {
+    Schema(usize),
+    Relation(usize, usize),
 }
 
 struct Tab {
@@ -68,7 +85,16 @@ impl Workspace {
             }
         })
         .detach();
-        let mut this = Self { url_input, connection: Connection::Idle, tabs: Vec::new(), active_tab: 0 };
+        let nav_focus = cx.focus_handle();
+        let mut this = Self {
+            url_input,
+            connection: Connection::Idle,
+            tabs: Vec::new(),
+            active_tab: 0,
+            nav_focus,
+            nav_highlight: None,
+            dev_action_applied: false,
+        };
         // Dev convenience: `PGB_URL=... PGB_AUTOCONNECT=1 cargo run` connects on startup.
         if std::env::var_os("PGB_AUTOCONNECT").is_some() {
             this.connect(window, cx);
@@ -136,6 +162,13 @@ impl Workspace {
                     };
                     for ix in wanted {
                         this.toggle_schema(ix, cx);
+                    }
+                }
+                // Dev hook: `PGB_NAV_KEY=down,down,right,enter` drives the navigator's keyboard
+                // handling directly, for screenshotting without simulating real OS key events.
+                if let Ok(keys) = std::env::var("PGB_NAV_KEY") {
+                    for key in keys.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        this.handle_nav_key(key, window, cx);
                     }
                 }
                 // Dev convenience: `PGB_OPEN=shop.customers` opens that table after connecting.
@@ -246,6 +279,90 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Flattens the currently-visible navigator rows in display order, for keyboard movement.
+    fn nav_rows(&self) -> Vec<NavRow> {
+        let Connection::Connected(conn) = &self.connection else { return Vec::new() };
+        let mut rows = Vec::new();
+        for (six, node) in conn.schemas.iter().enumerate() {
+            rows.push(NavRow::Schema(six));
+            if node.expanded {
+                if let Relations::Loaded(rels) = &node.relations {
+                    for rix in 0..rels.len() {
+                        rows.push(NavRow::Relation(six, rix));
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Moves the keyboard highlight to a specific row (used when a row is clicked, so arrow keys
+    /// pick up from wherever the mouse last was) and gives the navigator keyboard focus.
+    fn nav_set_highlight(&mut self, row: NavRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.nav_highlight = self.nav_rows().iter().position(|r| *r == row);
+        window.focus(&self.nav_focus, cx);
+        cx.notify();
+    }
+
+    /// ↑/↓ move the highlight; → expands a collapsed schema; ← collapses an expanded schema, or
+    /// (on a relation row) moves the highlight up to its parent schema; Enter opens the highlighted
+    /// relation, or toggles the highlighted schema.
+    fn on_nav_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.handle_nav_key(&ev.keystroke.key, window, cx);
+    }
+
+    /// Pure-ish key handling, split out from `on_nav_key_down` so a dev hook (`PGB_NAV_KEY`) can
+    /// drive it directly with a plain string instead of constructing a synthetic `KeyDownEvent`.
+    fn handle_nav_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let rows = self.nav_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let ix = self.nav_highlight.unwrap_or(0).min(rows.len() - 1);
+        match key {
+            "up" => {
+                self.nav_highlight = Some(ix.saturating_sub(1));
+                cx.notify();
+            }
+            "down" => {
+                self.nav_highlight = Some((ix + 1).min(rows.len() - 1));
+                cx.notify();
+            }
+            "right" => {
+                if let NavRow::Schema(six) = rows[ix] {
+                    let already_expanded = matches!(&self.connection, Connection::Connected(c) if c.schemas[six].expanded);
+                    if !already_expanded {
+                        self.nav_highlight = Some(ix);
+                        self.toggle_schema(six, cx);
+                    }
+                }
+            }
+            "left" => match rows[ix] {
+                NavRow::Schema(six) => {
+                    let expanded = matches!(&self.connection, Connection::Connected(c) if c.schemas[six].expanded);
+                    if expanded {
+                        self.toggle_schema(six, cx);
+                    }
+                    self.nav_highlight = Some(ix);
+                }
+                NavRow::Relation(six, _) => {
+                    self.nav_highlight = rows.iter().position(|r| *r == NavRow::Schema(six));
+                    cx.notify();
+                }
+            },
+            "enter" => match rows[ix] {
+                NavRow::Schema(six) => self.toggle_schema(six, cx),
+                NavRow::Relation(six, rix) => {
+                    let Connection::Connected(conn) = &self.connection else { return };
+                    let Relations::Loaded(rels) = &conn.schemas[six].relations else { return };
+                    let (schema, name, est) = (rels[rix].schema.clone(), rels[rix].name.clone(), rels[rix].estimated_rows);
+                    self.open_table(schema, name, Some(est), Initial::default(), window, cx);
+                }
+            },
+            _ => {}
+        }
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let connecting = matches!(self.connection, Connection::Connecting);
@@ -279,9 +396,24 @@ impl Workspace {
         let Connection::Connected(conn) = &self.connection else {
             return div().into_any_element();
         };
-        let mut rows = v_flex().id("navigator").flex_1().min_h_0().overflow_y_scroll().px_2().pb_2();
+        let mut rows = v_flex()
+            .id("navigator")
+            .track_focus(&self.nav_focus)
+            .key_context("Navigator")
+            .on_key_down(cx.listener(Self::on_nav_key_down))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2()
+            .pb_2();
+        // `flat_ix` must stay in the same push order as `nav_rows()` (schema, then its relations
+        // if expanded) so the keyboard highlight lines up with what is actually drawn.
+        let mut flat_ix = 0usize;
         for (ix, node) in conn.schemas.iter().enumerate() {
             let dim = node.schema.is_system || !node.schema.can_use;
+            let schema_row = NavRow::Schema(ix);
+            let highlighted = self.nav_highlight == Some(flat_ix);
+            flat_ix += 1;
             rows = rows.child(
                 h_flex()
                     .id(("schema", ix))
@@ -292,6 +424,7 @@ impl Workspace {
                     .items_center()
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.sidebar_accent))
+                    .when(highlighted, |row| row.bg(theme.sidebar_accent))
                     .text_color(if dim { theme.muted_foreground } else { theme.sidebar_foreground })
                     .child(
                         Icon::new(if node.expanded { IconName::ChevronDown } else { IconName::ChevronRight })
@@ -302,7 +435,10 @@ impl Workspace {
                     .when(!node.schema.can_use, |row| {
                         row.child(Icon::new(IconName::Lock).size_3().text_color(theme.muted_foreground))
                     })
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_schema(ix, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.nav_set_highlight(schema_row, window, cx);
+                        this.toggle_schema(ix, cx);
+                    })),
             );
             if !node.expanded {
                 continue;
@@ -326,6 +462,9 @@ impl Workspace {
                 }
                 Relations::Loaded(rels) => {
                     for (rix, rel) in rels.iter().enumerate() {
+                        let relation_row = NavRow::Relation(ix, rix);
+                        let highlighted = self.nav_highlight == Some(flat_ix);
+                        flat_ix += 1;
                         rows = rows.child(
                             h_flex()
                                 .id(("relation", ix * 100_000 + rix))
@@ -337,9 +476,11 @@ impl Workspace {
                                 .items_center()
                                 .cursor_pointer()
                                 .hover(|s| s.bg(theme.sidebar_accent))
+                                .when(highlighted, |row| row.bg(theme.sidebar_accent))
                                 .on_click({
                                     let (schema, name, est) = (rel.schema.clone(), rel.name.clone(), rel.estimated_rows);
                                     cx.listener(move |this, _, window, cx| {
+                                        this.nav_set_highlight(relation_row, window, cx);
                                         this.open_table(schema.clone(), name.clone(), Some(est), Initial::default(), window, cx)
                                     })
                                 })
@@ -494,13 +635,72 @@ impl Workspace {
     }
 }
 
+/// App-level action handlers (bound in `app_actions::init` and dispatched from anywhere in the
+/// window, or from the native menu). Each is a thin wrapper over an existing method so the
+/// behaviour is identical whether it was triggered by a click, a shortcut or the menu.
+impl Workspace {
+    fn on_close_active_tab(&mut self, _: &CloseActiveTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
+            self.close_tab(self.active_tab, cx);
+        }
+    }
+
+    fn on_next_tab(&mut self, _: &NextTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
+            self.active_tab = (self.active_tab + 1) % self.tabs.len();
+            cx.notify();
+        }
+    }
+
+    fn on_prev_tab(&mut self, _: &PrevTab, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.tabs.is_empty() {
+            self.active_tab = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+            cx.notify();
+        }
+    }
+
+    fn on_reload_active(&mut self, _: &ReloadActive, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.view.update(cx, |view, cx| view.reload_now(cx));
+        }
+    }
+
+    fn on_focus_filter(&mut self, _: &FocusFilter, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            tab.view.update(cx, |view, cx| view.focus_filter_input(window, cx));
+        }
+    }
+
+    fn on_focus_navigator(&mut self, _: &FocusNavigator, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.nav_focus, cx);
+    }
+}
+
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Dev hook: `PGB_ACTION=close_tab` dispatches the real `CloseActiveTab` action through
+        // GPUI's normal action-dispatch (not calling the handler directly), to verify the
+        // `cx.bind_keys`/`on_action` wiring itself, not just its handler body. Runs from `render`
+        // (not mid-`connect`), so the navigator this focuses first has actually been painted at
+        // least once — `dispatch_action` resolves against the *rendered* frame's focus tree.
+        if !self.dev_action_applied && !self.tabs.is_empty() {
+            if std::env::var("PGB_ACTION").as_deref() == Ok("close_tab") {
+                self.dev_action_applied = true;
+                window.focus(&self.nav_focus, cx);
+                window.dispatch_action(Box::new(CloseActiveTab), cx);
+            }
+        }
         let theme = cx.theme();
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
+            .on_action(cx.listener(Self::on_close_active_tab))
+            .on_action(cx.listener(Self::on_next_tab))
+            .on_action(cx.listener(Self::on_prev_tab))
+            .on_action(cx.listener(Self::on_reload_active))
+            .on_action(cx.listener(Self::on_focus_filter))
+            .on_action(cx.listener(Self::on_focus_navigator))
             .child(
                 TitleBar::new().child(
                     h_flex()
@@ -518,6 +718,12 @@ impl Render for Workspace {
                     .child(div().flex_1().min_w_0().h_full().child(self.render_main(cx))),
             )
             .child(self.render_status_bar(cx))
+            // `Root::render` does not mount these itself (see its doc comment on the trait impl in
+            // gpui-component); without this, `window.open_dialog` / `open_sheet` / notifications
+            // register on `Root` but are never painted.
+            .children(Root::render_notification_layer(window, cx))
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

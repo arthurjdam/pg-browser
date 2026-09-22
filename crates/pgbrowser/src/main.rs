@@ -1,4 +1,6 @@
+mod app_actions;
 mod data_view;
+mod value_viewer;
 mod runtime;
 mod screenshot;
 mod theme;
@@ -12,6 +14,7 @@ fn main() {
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
         gpui_kit::init(cx);
         theme::install(cx);
+        app_actions::init(cx);
         cx.spawn(async move |cx| {
             let window = cx
                 .update(|cx| {
