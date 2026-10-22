@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Renders a component sandbox (see crates/pgbrowser/src/stories.rs) to a PNG. No database needed.
+#
+#   script/story cells out.png                         # default theme (Ayu, following the system)
+#   PGB_THEME="Ayu Dark" script/story cells dark.png
+#
+# macOS uses GPUI's offscreen capture (the `screenshot` feature). Linux has no offscreen capture,
+# so the window is shown on a virtual X display (Xvfb) and grabbed with ImageMagick's `import`;
+# without a GPU, Mesa's software Vulkan driver (lavapipe, `mesa-vulkan-drivers`) renders it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+story="$1"; out="$2"
+if [[ "$(uname)" == Darwin ]]; then
+    cargo build -q -p pgbrowser --features screenshot
+    PGB_STORY="$story" PGB_SCREENSHOT="$out" PGB_SCREENSHOT_DELAY_MS="${DELAY:-1500}" ./target/debug/pg-browser
+    exit
+fi
+cargo build -q -p pgbrowser
+display=":$((90 + RANDOM % 9))"
+Xvfb "$display" -screen 0 1700x2700x24 >/dev/null 2>&1 &
+xvfb=$!
+trap 'kill $xvfb 2>/dev/null || true' EXIT
+lvp=/usr/share/vulkan/icd.d/lvp_icd.json
+[[ -f $lvp ]] && export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-$lvp}"
+DISPLAY="$display" PGB_STORY="$story" ./target/debug/pg-browser >"$out.log" 2>&1 &
+app=$!
+sleep "${DELAY:-8}"
+DISPLAY="$display" import -window root "$out"
+kill $app 2>/dev/null || true
+# Cut away the empty screen around the window.
+convert "$out" -bordercolor black -border 1 -trim +repage "$out"
+echo "story written to $out"
